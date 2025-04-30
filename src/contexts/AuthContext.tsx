@@ -1,7 +1,7 @@
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { toast } from "@/components/ui/use-toast";
-import { api } from '@/lib/api';
+import { supabase } from '@/integrations/supabase/client';
 
 interface User {
   id: string;
@@ -34,8 +34,15 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     const validateToken = async () => {
       if (token) {
         try {
-          const response = await api.get('/auth/user/');
-          setUser(response.data);
+          const { data: { user } } = await supabase.auth.getUser(token);
+          if (user) {
+            setUser({
+              id: user.id,
+              email: user.email || '',
+              username: user.user_metadata.username || user.email?.split('@')[0] || '',
+              is_verified: user.email_confirmed_at !== null,
+            });
+          }
         } catch (error) {
           console.error('Error validating token:', error);
           localStorage.removeItem('token');
@@ -45,30 +52,70 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       setIsLoading(false);
     };
 
+    // Set up auth state listener
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        if (session) {
+          const user = session.user;
+          setToken(session.access_token);
+          localStorage.setItem('token', session.access_token);
+          
+          setUser({
+            id: user.id,
+            email: user.email || '',
+            username: user.user_metadata.username || user.email?.split('@')[0] || '',
+            is_verified: user.email_confirmed_at !== null,
+          });
+        } else {
+          setToken(null);
+          setUser(null);
+          localStorage.removeItem('token');
+        }
+      }
+    );
+
     validateToken();
+    
+    return () => {
+      subscription.unsubscribe();
+    };
   }, [token]);
 
   // Login function
   const login = async (email: string, password: string) => {
     try {
       setIsLoading(true);
-      const response = await api.post('/auth/login/', { email, password });
-      const { access, user: userData } = response.data;
-      
-      localStorage.setItem('token', access);
-      setToken(access);
-      setUser(userData);
-      
-      toast({
-        title: "Login successful",
-        description: `Welcome back, ${userData.username}!`,
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
       });
+      
+      if (error) throw error;
+      
+      if (data.session) {
+        const { access_token, user } = data.session;
+        
+        setToken(access_token);
+        localStorage.setItem('token', access_token);
+        
+        setUser({
+          id: user.id,
+          email: user.email || '',
+          username: user.user_metadata.username || user.email?.split('@')[0] || '',
+          is_verified: user.email_confirmed_at !== null,
+        });
+        
+        toast({
+          title: "Login successful",
+          description: `Welcome back!`,
+        });
+      }
     } catch (error: any) {
       console.error('Login error:', error);
       let errorMessage = "Login failed. Please check your credentials.";
       
-      if (error.response?.data?.detail) {
-        errorMessage = error.response.data.detail;
+      if (error.message) {
+        errorMessage = error.message;
       }
       
       toast({
@@ -86,7 +133,18 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const register = async (username: string, email: string, password: string) => {
     try {
       setIsLoading(true);
-      await api.post('/auth/register/', { username, email, password });
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            username,
+            full_name: username,
+          },
+        },
+      });
+      
+      if (error) throw error;
       
       toast({
         title: "Registration successful",
@@ -96,8 +154,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       console.error('Registration error:', error);
       let errorMessage = "Registration failed. Please try again.";
       
-      if (error.response?.data) {
-        errorMessage = Object.values(error.response.data).flat().join(' ');
+      if (error.message) {
+        errorMessage = error.message;
       }
       
       toast({
@@ -112,21 +170,35 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   // Logout function
-  const logout = () => {
-    localStorage.removeItem('token');
-    setToken(null);
-    setUser(null);
-    toast({
-      title: "Logged out",
-      description: "You have been successfully logged out.",
-    });
+  const logout = async () => {
+    try {
+      await supabase.auth.signOut();
+      localStorage.removeItem('token');
+      setToken(null);
+      setUser(null);
+      toast({
+        title: "Logged out",
+        description: "You have been successfully logged out.",
+      });
+    } catch (error) {
+      console.error('Logout error:', error);
+      toast({
+        variant: "destructive",
+        title: "Logout failed",
+        description: "Failed to log out. Please try again.",
+      });
+    }
   };
 
   // Request password reset
   const requestPasswordReset = async (email: string) => {
     try {
       setIsLoading(true);
-      await api.post('/auth/password-reset/', { email });
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: window.location.origin + '/reset-password',
+      });
+      
+      if (error) throw error;
       
       toast({
         title: "Password reset request sent",
@@ -136,8 +208,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       console.error('Password reset request error:', error);
       let errorMessage = "Failed to request password reset. Please try again.";
       
-      if (error.response?.data?.detail) {
-        errorMessage = error.response.data.detail;
+      if (error.message) {
+        errorMessage = error.message;
       }
       
       toast({
@@ -155,7 +227,9 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const resetPassword = async (token: string, password: string) => {
     try {
       setIsLoading(true);
-      await api.post('/auth/password-reset/confirm/', { token, password });
+      const { error } = await supabase.auth.updateUser({ password });
+      
+      if (error) throw error;
       
       toast({
         title: "Password reset successful",
@@ -165,8 +239,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       console.error('Password reset error:', error);
       let errorMessage = "Failed to reset password. Please try again.";
       
-      if (error.response?.data?.detail) {
-        errorMessage = error.response.data.detail;
+      if (error.message) {
+        errorMessage = error.message;
       }
       
       toast({
@@ -184,14 +258,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const verifyEmail = async (token: string) => {
     try {
       setIsLoading(true);
-      await api.post('/auth/verify-email/', { token });
-      
-      if (user) {
-        setUser({
-          ...user,
-          is_verified: true,
-        });
-      }
+      // For Supabase, this happens automatically via the URL
+      // This function is kept for API compatibility
       
       toast({
         title: "Email verified",
@@ -201,8 +269,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       console.error('Email verification error:', error);
       let errorMessage = "Failed to verify email. Please try again.";
       
-      if (error.response?.data?.detail) {
-        errorMessage = error.response.data.detail;
+      if (error.message) {
+        errorMessage = error.message;
       }
       
       toast({
