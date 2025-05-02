@@ -2,8 +2,9 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { toast } from "@/components/ui/use-toast";
 import { supabase } from '@/integrations/supabase/client';
+import { User } from '@supabase/supabase-js';
 
-interface User {
+interface UserProfile {
   id: string;
   email: string;
   username: string;
@@ -11,75 +12,78 @@ interface User {
 }
 
 interface AuthContextType {
-  user: User | null;
+  user: UserProfile | null;
   token: string | null;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
   register: (username: string, email: string, password: string) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
   requestPasswordReset: (email: string) => Promise<void>;
-  resetPassword: (token: string, password: string) => Promise<void>;
+  resetPassword: (password: string) => Promise<void>;
   verifyEmail: (token: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
 export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
-  const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [token, setToken] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+
+  // Handle user session and profile data
+  const handleUserSession = async (authUser: User | null) => {
+    if (!authUser) {
+      setUser(null);
+      setToken(null);
+      return;
+    }
+
+    setToken(authUser.email || '');
+
+    // Get user profile data
+    const username = authUser.user_metadata?.username || authUser.email?.split('@')[0] || '';
+    
+    setUser({
+      id: authUser.id,
+      email: authUser.email || '',
+      username: username,
+      is_verified: !!authUser.email_confirmed_at,
+    });
+  };
 
   // Check if user is logged in on initial load
   useEffect(() => {
-    const validateToken = async () => {
-      if (token) {
-        try {
-          const { data: { user } } = await supabase.auth.getUser(token);
-          if (user) {
-            setUser({
-              id: user.id,
-              email: user.email || '',
-              username: user.user_metadata.username || user.email?.split('@')[0] || '',
-              is_verified: user.email_confirmed_at !== null,
-            });
+    const setupAuth = async () => {
+      try {
+        setIsLoading(true);
+        
+        // Get the current session
+        const { data: { session } } = await supabase.auth.getSession();
+        
+        if (session?.user) {
+          await handleUserSession(session.user);
+        }
+        
+        // Set up auth state listener
+        const { data: { subscription } } = supabase.auth.onAuthStateChange(
+          async (event, session) => {
+            console.log('Auth state changed:', event);
+            await handleUserSession(session?.user || null);
           }
-        } catch (error) {
-          console.error('Error validating token:', error);
-          localStorage.removeItem('token');
-          setToken(null);
-        }
+        );
+        
+        return () => {
+          subscription.unsubscribe();
+        };
+      } catch (error) {
+        console.error('Auth setup error:', error);
+      } finally {
+        setIsLoading(false);
       }
-      setIsLoading(false);
     };
 
-    // Set up auth state listener
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (event, session) => {
-        if (session) {
-          const user = session.user;
-          setToken(session.access_token);
-          localStorage.setItem('token', session.access_token);
-          
-          setUser({
-            id: user.id,
-            email: user.email || '',
-            username: user.user_metadata.username || user.email?.split('@')[0] || '',
-            is_verified: user.email_confirmed_at !== null,
-          });
-        } else {
-          setToken(null);
-          setUser(null);
-          localStorage.removeItem('token');
-        }
-      }
-    );
-
-    validateToken();
-    
-    return () => {
-      subscription.unsubscribe();
-    };
-  }, [token]);
+    setupAuth();
+  }, []);
 
   // Login function
   const login = async (email: string, password: string) => {
@@ -92,18 +96,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       
       if (error) throw error;
       
-      if (data.session) {
-        const { access_token, user } = data.session;
-        
-        setToken(access_token);
-        localStorage.setItem('token', access_token);
-        
-        setUser({
-          id: user.id,
-          email: user.email || '',
-          username: user.user_metadata.username || user.email?.split('@')[0] || '',
-          is_verified: user.email_confirmed_at !== null,
-        });
+      if (data?.user) {
+        await handleUserSession(data.user);
         
         toast({
           title: "Login successful",
@@ -133,6 +127,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const register = async (username: string, email: string, password: string) => {
     try {
       setIsLoading(true);
+      
+      // Sign up the user with Supabase Auth
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
@@ -141,6 +137,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
             username,
             full_name: username,
           },
+          emailRedirectTo: `${window.location.origin}/verify-email`,
         },
       });
       
@@ -150,6 +147,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         title: "Registration successful",
         description: "Please check your email to verify your account.",
       });
+      
+      return;
     } catch (error: any) {
       console.error('Registration error:', error);
       let errorMessage = "Registration failed. Please try again.";
@@ -172,15 +171,17 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   // Logout function
   const logout = async () => {
     try {
-      await supabase.auth.signOut();
-      localStorage.removeItem('token');
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      
       setToken(null);
       setUser(null);
+      
       toast({
         title: "Logged out",
         description: "You have been successfully logged out.",
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Logout error:', error);
       toast({
         variant: "destructive",
@@ -195,7 +196,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     try {
       setIsLoading(true);
       const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: window.location.origin + '/reset-password',
+        redirectTo: `${window.location.origin}/reset-password`,
       });
       
       if (error) throw error;
@@ -224,7 +225,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   // Reset password with token
-  const resetPassword = async (token: string, password: string) => {
+  const resetPassword = async (password: string) => {
     try {
       setIsLoading(true);
       const { error } = await supabase.auth.updateUser({ password });
@@ -258,7 +259,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const verifyEmail = async (token: string) => {
     try {
       setIsLoading(true);
-      // For Supabase, this happens automatically via the URL
+      // This is handled automatically by Supabase redirection
       // This function is kept for API compatibility
       
       toast({
